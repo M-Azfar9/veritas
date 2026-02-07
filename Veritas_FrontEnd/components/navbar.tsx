@@ -5,6 +5,7 @@ import Image from 'next/image';
 import { useState, useEffect } from 'react';
 import { UserSessionIndicator } from './user-session-indicator';
 import { NotificationPanel } from './notification-panel';
+import { HowItWorksModal } from './how-it-works-modal';
 import api from '@/lib/api';
 
 export function Navbar() {
@@ -80,6 +81,7 @@ export function Navbar() {
 
           {/* Notifications & Auth */}
           <div className="hidden sm:flex items-center gap-2">
+            <HowItWorksModal />
             <NotificationPanel notifications={[
               {
                 id: '1',
