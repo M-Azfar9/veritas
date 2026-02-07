@@ -1,151 +1,111 @@
-from rest_framework import viewsets, status, filters
-from rest_framework.decorators import action
+from rest_framework import viewsets, status, permissions
 from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated, IsAuthenticatedOrReadOnly
-from django.db.models import Count, Q
-from django.shortcuts import get_object_or_404
-from decimal import Decimal
-import math
-
+from rest_framework.decorators import action
+from rest_framework.throttling import ScopedRateThrottle, UserRateThrottle, AnonRateThrottle
+from django.db.models import F
 from .models import Rumor, Vote, Proof, ProofVote
-from .serializers import RumorSerializer, VoteSerializer, ProofSerializer
-from .services import calculate_trust_score, update_proof_trust_score
-from .tasks import update_trust_score_task
+from .serializers import RumorSerializer, VoteSerializer, ProofSerializer, ProofVoteSerializer
+from .tasks import update_trust_score_task, update_proof_trust_score_task
 
 class RumorViewSet(viewsets.ModelViewSet):
-    queryset = Rumor.objects.all()
+    queryset = Rumor.objects.all().order_by('-created_at')
     serializer_class = RumorSerializer
-    permission_classes = [IsAuthenticatedOrReadOnly]
-    filter_backends = [filters.OrderingFilter, filters.SearchFilter]
-    search_fields = ['content']
-    ordering_fields = ['created_at', 'trust_score', 'vote_count']
-    ordering = ['-created_at'] # Default list is 'Latest'
-
-    def get_queryset(self):
-        queryset = super().get_queryset()
-        queryset = queryset.annotate(
-            vote_count=Count('votes', distinct=True),
-            proof_count=Count('proofs', distinct=True)
-        )
-        
-        # Filtering
-        filter_type = self.request.query_params.get('filter', 'all')
-        if filter_type == 'frozen':
-            queryset = queryset.filter(is_frozen=True)
-        elif filter_type == 'active':
-            queryset = queryset.filter(is_frozen=False)
-        
-        # Sorting
-        sort_by = self.request.query_params.get('sort', 'latest')
-        if sort_by == 'trending':
-            queryset = queryset.order_by('-vote_count', '-created_at')
-        elif sort_by == 'trusted':
-            queryset = queryset.filter(is_frozen=True).order_by('-trust_score')
-        elif sort_by == 'controversial':
-             pass 
-        
-        return queryset
+    permission_classes = [permissions.IsAuthenticatedOrReadOnly]
+    
+    def get_throttles(self):
+        if self.action == 'create':
+            self.throttle_scope = 'rumor_creation'
+            return [ScopedRateThrottle()]
+        if self.action == 'vote':
+            self.throttle_scope = 'voting'
+            return [ScopedRateThrottle()]
+        return [UserRateThrottle(), AnonRateThrottle()]
 
     def perform_create(self, serializer):
         serializer.save(author=self.request.user)
 
-    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
+    @action(detail=True, methods=['post'])
     def vote(self, request, pk=None):
-        print(f"DEBUG: Vote Request Data: {request.data}")
-        print(f"DEBUG: User: {request.user}")
-        
         rumor = self.get_object()
         user = request.user
         
-        try:
-            vote = Vote.objects.get(rumor=rumor, voter=user)
-            if vote.change_count >= 3:
-                 print("DEBUG: Max vote changes reached")
+        # Validate input
+        serializer = VoteSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+            
+        vote_type = serializer.validated_data['vote_type']
+        
+        # Check existing vote
+        existing_vote = Vote.objects.filter(rumor=rumor, voter=user).first()
+        if existing_vote:
+            if existing_vote.change_count >= 3:
                  return Response({'error': 'Max vote changes reached'}, status=status.HTTP_400_BAD_REQUEST)
-            vote.change_count += 1
-        except Vote.DoesNotExist:
-            vote = Vote(rumor=rumor, voter=user)
+            existing_vote.vote_type = vote_type
+            existing_vote.change_count += 1
+            existing_vote.save()
+        else:
+            Vote.objects.create(rumor=rumor, voter=user, vote_type=vote_type)
+            
+        # Trigger Async Update
+        update_trust_score_task.delay(rumor.rumor_id)
         
-        vote_type = request.data.get('vote_type')
-        if not vote_type:
-            print("DEBUG: vote_type missing")
-            return Response({'error': 'vote_type required'}, status=status.HTTP_400_BAD_REQUEST)
-        
-        vote.vote_type = vote_type
-        # Map type to value
-        vote_map = {'VERIFY': 1.0, 'UNCERTAIN': 0.5, 'DISPUTE': 0.0}
-        vote.vote_value = vote_map.get(vote_type, 0.5)
-        
-        # Snapshot weight
-        rep = user.profile_trust_score
-        weight = Decimal(math.sqrt(rep)) / Decimal('10.0')
-        vote.weight_snapshot = weight
-        vote.voter_reputation_snapshot = rep
-        
-        vote.save()
-        
-        # Trigger Async Task
-        try:
-            update_trust_score_task.delay(rumor.rumor_id)
-            message = 'Vote cast. Trust score updating in background.'
-        except Exception as e:
-             print(f"DEBUG: Async task failed: {e}")
-             calculate_trust_score(rumor.rumor_id)
-             message = 'Vote cast. Trust score updated.'
-        
-        return Response({
-            'status': 'vote cast',
-            'vote_weight': float(weight),
-            'message': message
-        })
+        return Response({'status': 'vote recorded'}, status=status.HTTP_200_OK)
 
 class ProofViewSet(viewsets.ModelViewSet):
-    queryset = Proof.objects.all()
+    queryset = Proof.objects.all().order_by('-trust_score')
     serializer_class = ProofSerializer
-    permission_classes = [IsAuthenticatedOrReadOnly]
+    permission_classes = [permissions.IsAuthenticatedOrReadOnly]
+    filterset_fields = ['rumor']
 
     def get_queryset(self):
         queryset = super().get_queryset()
         rumor_id = self.request.query_params.get('rumor')
         if rumor_id:
             queryset = queryset.filter(rumor_id=rumor_id)
-        return queryset.order_by('-trust_score', '-created_at')
+        return queryset
+
+    def get_throttles(self):
+        if self.action == 'create':
+            self.throttle_scope = 'proof_submission'
+            return [ScopedRateThrottle()]
+        if self.action == 'vote':
+            self.throttle_scope = 'voting'
+            return [ScopedRateThrottle()]
+        return [UserRateThrottle(), AnonRateThrottle()]
 
     def perform_create(self, serializer):
-        proof = serializer.save(poster=self.request.user)
-        try:
-            update_trust_score_task.delay(proof.rumor.rumor_id)
-        except Exception:
-            calculate_trust_score(proof.rumor.rumor_id)
+        serializer.save(user=self.request.user)
+        # Trigger update (Proof added -> Impact on P score?)
+        # Only mature proofs count, but we might want to recalc anyway or wait for votes?
+        # Let's trigger it.
+        # But wait, we need rumor_id.
+        proof = serializer.instance
+        if proof:
+             # Logic to update Rumor score? 
+             # P score is based on Mature proofs. New proof is not mature.
+             # So no immediate impact on Rumor Score. 
+             pass
 
-    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
+    @action(detail=True, methods=['post'])
     def vote(self, request, pk=None):
         proof = self.get_object()
         user = request.user
         
-        try:
-            vote = ProofVote.objects.get(proof=proof, voter=user)
-        except ProofVote.DoesNotExist:
-            vote = ProofVote(proof=proof, voter=user)
+        serializer = ProofVoteSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+            
+        vote_type = serializer.validated_data['vote_type']
         
-        vote_type = request.data.get('vote_type') 
+        existing_vote = ProofVote.objects.filter(proof=proof, voter=user).first()
+        if existing_vote:
+            existing_vote.vote_type = vote_type
+            existing_vote.save()
+        else:
+            ProofVote.objects.create(proof=proof, voter=user, vote_type=vote_type)
+            
+        # Trigger Update
+        update_proof_trust_score_task.delay(proof.proof_id)
         
-        if not vote_type:
-             return Response({'error': 'vote_type required'}, status=status.HTTP_400_BAD_REQUEST)
-
-        vote.vote_type = vote_type
-        if vote_type == 'SUPPORTS': val = Decimal('1.0')
-        elif vote_type == 'REFUTES': val = Decimal('0.0')
-        else: val = Decimal('0.5')
-        
-        vote.vote_value = val
-        
-        rep = user.profile_trust_score
-        weight = Decimal(math.sqrt(rep)) / Decimal('10.0')
-        vote.weight_snapshot = weight
-        
-        vote.save()
-        
-        update_proof_trust_score(proof.proof_id)
-        
-        return Response({'status': 'vote cast on proof'})
+        return Response({'status': 'vote recorded'}, status=status.HTTP_200_OK)
